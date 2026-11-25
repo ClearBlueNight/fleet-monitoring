@@ -1,0 +1,81 @@
+# Infrastruktura : Redis, Cassandra, InfluxDB 3 Core.
+# Pokretanje iz deploy/ foldera:  docker compose up -d
+name: fleet
+
+services:
+  redis:
+    image: ${REDIS_IMAGE:-redis:7.4}
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf", "--requirepass", "${REDIS_PASSWORD:?Postavi REDIS_PASSWORD u deploy/.env}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 512m
+    restart: unless-stopped
+
+  cassandra:
+    image: ${CASSANDRA_IMAGE:-cassandra:5.0}
+    environment:
+      CASSANDRA_CLUSTER_NAME: fleet-dev
+      MAX_HEAP_SIZE: ${CASSANDRA_MAX_HEAP:-1G}
+      HEAP_NEWSIZE: ${CASSANDRA_HEAP_NEWSIZE:-256M}
+    ports:
+      - "127.0.0.1:9042:9042"
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe keyspaces' >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+    mem_limit: 3g
+    restart: unless-stopped
+
+  cassandra-init:
+    image: ${CASSANDRA_IMAGE:-cassandra:5.0}
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    volumes:
+      - ./cassandra:/init:ro
+    command: ["cqlsh", "cassandra", "9042", "-f", "/init/schema.cql"]
+    restart: "no"
+
+  influxdb3:
+    image: ${INFLUX_IMAGE:-influxdb:3-core}
+    command:
+      - influxdb3
+      - serve
+      - --node-id=node0
+      - --object-store=file
+      - --data-dir=/var/lib/influxdb3
+      - --without-auth
+    ports:
+      - "127.0.0.1:8181:8181"
+    volumes:
+      - influx-data:/var/lib/influxdb3
+    mem_limit: 2g
+    restart: unless-stopped
+
+  influx-init:
+    image: alpine:3.20
+    depends_on:
+      - influxdb3
+    volumes:
+      - ./influx/init.sh:/init.sh:ro
+    command: ["sh", "-c", "apk add --no-cache curl >/dev/null && sh /init.sh"]
+    restart: "no"
+
+volumes:
+  redis-data:
+  cassandra-data:
+  influx-data:
