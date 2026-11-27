@@ -1,5 +1,6 @@
 ﻿using System.Globalization;
 using StackExchange.Redis;
+using System.Diagnostics;
 
 // Connect
 var password = Environment.GetEnvironmentVariable("REDIS_PASSWORD");
@@ -16,6 +17,7 @@ options.AbortOnConnectFail = false;
 using var mux = await ConnectionMultiplexer.ConnectAsync(options);
 var db = mux.GetDatabase();
 var server = mux.GetServer(mux.GetEndPoints()[0]);
+var mode = args.FirstOrDefault() ?? "write";
 Console.WriteLine($"Connected: {mux.IsConnected}");
 
 // Key naming helpers
@@ -84,6 +86,54 @@ async Task Cleanup()
 {
     foreach (var key in server.Keys(pattern: Key("*")).ToArray())
         await db.KeyDeleteAsync(key);
+}
+
+// Verify mode
+if(mode == "verify")
+{
+    Console.WriteLine("===== VERIFY =====");
+
+    foreach (var name in new[] {  "berlin", "prague", "warsaw", "vienna", "budapest" })
+    {
+        var hashExists = await db.KeyExistsAsync(Key($"truck:{name}"));
+        var inGeo = (await db.GeoPositionAsync(Key($"geo"), name)) is not null;
+        var isLastSeen = (await db.SortedSetScoreAsync(Key("lastseen"), name)) is not null;
+        Check($"{name}: hash, geo and lastseen survived", hashExists && inGeo && isLastSeen);
+    }
+
+    Check("berlin is still Idle", (string?)await db.HashGetAsync(Key("truck:berlin"), "status") == "Idle");
+    Check("berlin is in the idle set", await db.SetContainsAsync(Key("status:Idle"), "berlin"));
+    Check("berlin is not in the moving set", !await db.SetContainsAsync(Key("status:Moving"), "berlin"));
+
+    Console.WriteLine(failures == 0 ? "\nALL PASSED" : $"\nFAILED: {failures}");
+    return failures == 0 ? 0 : 1;
+}
+
+// load test (heavy)
+{
+    const int truckCount = 200;
+    const int rounds = 100;
+    var baseMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+    var applied = 0;
+    var sw = Stopwatch.StartNew();
+
+    for( var round = 0; round < rounds; round++)
+    {
+        var roundMs = baseMs + round * 1000L;
+        var status = round % 2 == 0 ? "Moving" : "Idle";
+
+        var batch = Enumerable.Range(0, truckCount).Select(async i =>
+        {
+            var res = await Apply($"load-{i}", roundMs, 50 + i * 0.01, 10 + i * 0.01, 60, status);
+            if(res.Applied) Interlocked.Increment(ref applied);
+        });
+        await Task.WhenAll(batch);
+    }
+
+    sw.Stop();
+    var total = truckCount * rounds;
+    Check($"Load test: all {total} updates applied", applied == total, $"{applied}/{total}");
+    Console.WriteLine($"    {total / sw.Elapsed.TotalSeconds:N0} calls/s ({sw.ElapsedMilliseconds}) ms total");
 }
 
 // Functional tests
